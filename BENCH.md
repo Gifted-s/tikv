@@ -22,37 +22,3 @@ SETUP (Benchmark on a single node)
 
 ## Observation
 Significant spike in the tail latency for update
-## Why Write Latency Can Spike in TiKV During Region Splits
-
-Several factors related to TiKV's **Region splits** can cause dramatic spikes in write latency:
-
----
-### 1. Region Splits
-
-TiKV stores data in **regions**, which are chunks of data (about **96 MB** by default).
-
-* **The Process:** When a region exceeds its size limit, TiKV splits it into two. This involves:
-    * Writing new **region metadata**.
-    * Updating the **Placement Driver (PD)** service.
-    * Potentially moving some **in-memory state**.
-* **Latency Spike:** Writes to the splitting region can **stall** (or be delayed) until the split operation is complete, leading to a huge spike in write latency.
-
-
----
-### 2. Raft Log Flush
-
-Every write in TiKV, even on a single-node setup, goes through **Raft consensus** for correctness.
-
-* **Latency Impact:** Large writes or a burst of writes happening **during a split** can delay the flushing of the **Raft log** to disk, which directly increases write latency.
-
----
-### 3. Storage IO or WAL Flush
-
-TiKV persists writes to the **Write-Ahead Log (WAL)** to ensure durability.
-
-* **Latency Impact:** If the disk is busy (due to other operations) or a required **`fsync`** (forced synchronization to disk) operation happens concurrently with a **region split**, the write latency can spike.
-
----
-### 4. Snapshot Creation
-
-* **Latency Impact:** **Region splits** can sometimes trigger the creation of **region snapshots**. Snapshot creation can briefly **block writes** to the region, contributing to temporary latency spikes.
