@@ -36,7 +36,7 @@ TiKV stores data in **regions**, which are chunks of data (about **96 MB** by de
     * Updating the **Placement Driver (PD)** service.
     * Potentially moving some **in-memory state**.
 * **Latency Spike:** Writes to the splitting region can **stall** (or be delayed) until the split operation is complete, leading to a huge spike in write latency.
-* **Single-Node Impact:** **Single-node setups** are particularly vulnerable. Since all splits happen locally without parallel distribution, the **tail latency** (the latency experienced by the slowest writes) can jump dramatically.
+
 
 ---
 ### 2. Raft Log Flush
