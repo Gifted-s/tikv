@@ -22,3 +22,41 @@ SETUP (Benchmark on a single node)
 
 ## Observation
 Significant spike in the tail latency for update
+
+
+## Benchmarking per client  (Goal: What is the max throughput/client and avarage latency for this requests)
+Note: This experiment was ran on a personal machine not an isolated environment (To fix later).
+
+Runs: 3
+
+Config 
+### ⚙️ Go-YCSB TiKV Load Configuration
+
+| Parameter | Value |
+|------------|--------|
+| Command | `./bin/go-ycsb load tikv -P workloads/workload_insert` |
+| `tikv.pd` | `127.0.0.1:2379` |
+| `threadcount` | `12` |
+| `batchsize` | `3500000` |
+| `tikv.batchsize` | `3500000` |
+| `tikv.conncount` | `1` |
+| `recordcount` | `3500000` |
+| `operationcount` | `1` |
+| `workload` | `core` |
+| `readallfields` | `true` |
+| `readproportion` | `0` |
+| `updateproportion` | `0` |
+| `scanproportion` | `0` |
+| `insertproportion` | `1` |
+| `requestdistribution` | `uniform` |
+
+
+
+### 🧮 TiKV Go-YCSB Insert Benchmark (3.5M records, 12 threads, 1 Client)
+
+| Run | Duration (s) | OPS | Avg (µs) | Min (µs) | Max (µs) | 50th (µs) | 90th (µs) | 95th (µs) | 99th (µs) | 99.9th (µs) | 99.99th (µs) |
+|-----|---------------|------|-----------|-----------|-----------|-------------|-------------|-------------|-------------|---------------|----------------|
+| 1 | 179.9 | 19,454.7 | 610 | 101 | 104,319 | 382 | 1,639 | 1,811 | 2,341 | 8,759 | 33,119 |
+| 2 | 178.9 | 19,569.4 | 607 | 101 | 190,591 | 384 | 1,631 | 1,802 | 2,309 | 8,327 | 29,983 |
+| 3 | 178.8 | 19,580.2 | 606 | 99 | 105,855 | 384 | 1,624 | 1,795 | 2,307 | 8,415 | 27,551 |
+| **Average** | **179.2** | **19,534.8** | **607.7** | **100.3** | **133,588.3** | **383.3** | **1,631.3** | **1,802.7** | **2,319.0** | **8,500.3** | **30,218.0** |
