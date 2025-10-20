@@ -45,7 +45,7 @@ Significant spike in the tail latency for update
 
 
 ## Benchmarking per client  
-Goal: What is the max throughput/client and avarage latency for this requests
+Goal: What is the max throughput/client and avarage latency for these requests
 Note: This experiment was ran on a personal machine not an isolated environment (To fix later).
 Different batch sizes was tested
 
