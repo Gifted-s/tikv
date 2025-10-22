@@ -838,6 +838,415 @@ pub struct Config {
 
 This architecture demonstrates how TiKV successfully balances the competing demands of high performance and strong consistency in a distributed storage system, making it suitable for production workloads that require both high throughput and reliable data consistency.
 
+## Detailed Example: Write Request Flow in TiKV
+
+### Scenario Setup
+Let's say we have a TiKV cluster with 3 regions and 2 write requests:
+
+**Write Request 1**: `PUT key="user:123", value="John Doe"` → Region A (region_id=1)
+**Write Request 2**: `PUT key="user:456", value="Jane Smith"` → Region B (region_id=2)
+
+### Step-by-Step Execution
+
+## Stage 1: Client Request Entry
+**Thread**: Main Server Thread
+**Time**: T0
+
+```rust
+// Client sends write request
+async_write(
+    ctx: Context { region_id: 1 },
+    batch: WriteData {
+        modifies: vec![Modify::Put("user:123", "John Doe")],
+        extra: WriteExtra { one_pc: false }
+    }
+)
+
+// Converted to RaftCmdRequest
+RaftCmdRequest {
+    header: RequestHeader {
+        region_id: 1,
+        region_epoch: RegionEpoch { version: 1, conf_ver: 1 },
+        term: 5,
+        // ...
+    },
+    requests: vec![Request {
+        cmd_type: CmdType::Put,
+        put: PutRequest {
+            key: b"user:123",
+            value: b"John Doe",
+            cf: "default"
+        }
+    }]
+}
+```
+
+## Stage 2: Store FSM Processing
+**Thread**: Store FSM Poller Thread
+**Time**: T1
+
+```rust
+// Store FSM receives message
+StoreMsg::RaftCommand(RaftCommand {
+    request: RaftCmdRequest { /* ... */ },
+    callback: Callback { /* ... */ },
+    send_time: T0
+})
+
+// Store FSM routes to Region A
+fn handle_msgs(&mut self, msgs: &mut Vec<StoreMsg>) {
+    for msg in msgs.drain(..) {
+        match msg {
+            StoreMsg::RaftCommand(cmd) => {
+                // Route to Region A (region_id=1)
+                self.ctx.router.send(1, PeerMsg::RaftCommand(cmd));
+            }
+        }
+    }
+}
+```
+
+## Stage 3: Peer FSM Processing (Region A)
+**Thread**: Peer FSM Poller Thread
+**Time**: T2
+
+```rust
+// Peer FSM for Region A receives command
+PeerMsg::RaftCommand(RaftCommand {
+    request: RaftCmdRequest { /* ... */ },
+    callback: Callback { /* ... */ },
+    send_time: T0
+})
+
+// Collect multiple messages for batching
+fn handle_msgs(&mut self, msgs: &mut Vec<PeerMsg>) {
+    while self.peer_msg_buf.len() < self.messages_per_tick { // e.g., 8
+        match peer.receiver.try_recv() {
+            Ok(msg) => {
+                self.peer_msg_buf.push(msg);
+                // peer_msg_buf now contains: [RaftCommand for user:123]
+            }
+            Err(TryRecvError::Empty) => break,
+        }
+    }
+    
+    // Process the batch
+    for msg in self.peer_msg_buf.drain(..) {
+        match msg {
+            PeerMsg::RaftCommand(cmd) => {
+                self.propose_raft_command(cmd.request, cmd.callback, diskfullopt);
+            }
+        }
+    }
+}
+```
+
+## Stage 4: Raft Proposal (Region A)
+**Thread**: Peer FSM Poller Thread
+**Time**: T3
+
+```rust
+// Propose to Raft consensus
+fn propose_raft_command_internal(&mut self, msg: RaftCmdRequest, cb: Callback) {
+    // Serialize the request
+    let data = msg.write_to_bytes()?; // "user:123=John Doe"
+    
+    // Propose to Raft
+    let propose_index = self.next_proposal_index(); // e.g., 1001
+    self.raft_group.propose(ctx.to_vec(), data)?;
+    
+    // Store callback for later
+    self.pending_cmds.append_normal(PendingCmd {
+        index: 1001,
+        term: 5,
+        cb: cb,
+        request: msg,
+        // ...
+    });
+    
+    // Raft log entry created:
+    // Entry { index: 1001, term: 5, data: "user:123=John Doe" }
+}
+```
+
+## Stage 5: Raft Ready Processing (Region A)
+**Thread**: Peer FSM Poller Thread
+**Time**: T4
+
+```rust
+// Raft ready contains committed entries
+Ready {
+    entries: vec![Entry {
+        index: 1001,
+        term: 5,
+        data: "user:123=John Doe"
+    }],
+    committed_entries: vec![Entry {
+        index: 1001,
+        term: 5,
+        data: "user:123=John Doe"
+    }],
+    // ...
+}
+
+// Create write task
+fn handle_raft_ready(&mut self, ready: &mut Ready) -> WriteTask {
+    let mut write_task = WriteTask::new(1, 1, ready.number());
+    
+    // Append committed entries
+    if !ready.entries().is_empty() {
+        self.append(ready.take_entries(), &mut write_task);
+    }
+    
+    // write_task now contains:
+    // - region_id: 1
+    // - entries: [Entry { index: 1001, term: 5, data: "user:123=John Doe" }]
+    // - raft_state: RaftLocalState { last_index: 1001, ... }
+    
+    write_task
+}
+```
+
+## Stage 6: Async Write Worker Processing
+**Thread**: Async Write Worker Thread
+**Time**: T5
+
+```rust
+// Async write worker receives write task
+WriteMsg::WriteTask(WriteTask {
+    region_id: 1,
+    entries: vec![Entry { index: 1001, term: 5, data: "user:123=John Doe" }],
+    raft_state: RaftLocalState { last_index: 1001, ... },
+    // ...
+})
+
+// Batch multiple write tasks
+fn run(&mut self) {
+    while self.batch.get_raft_size() < self.raft_write_size_limit { // e.g., 1MB
+        match self.receiver.try_recv() {
+            Ok(WriteMsg::WriteTask(task)) => {
+                self.batch.add_write_task(&self.raft_engine, task);
+                // batch now contains write tasks from multiple regions
+            }
+        }
+    }
+    
+    // Write to databases
+    self.write_to_db(true);
+}
+
+// Write to RocksDB and RaftDB
+fn write_to_db(&mut self) {
+    // Write KV data to RocksDB
+    if !self.batch.extra_batch_write.is_empty() {
+        let mut write_opts = WriteOptions::new();
+        write_opts.set_sync(true);
+        self.batch.extra_batch_write.write_opt(&write_opts)?;
+    }
+    
+    // Write Raft log to RaftDB
+    for raft_wb in &mut self.batch.raft_wbs {
+        self.raft_engine.consume_and_shrink(raft_wb, true, ...)?;
+    }
+    
+    // Persisted to disk:
+    // RaftDB: Entry { index: 1001, term: 5, data: "user:123=John Doe" }
+    // RocksDB: (will be written later by Apply FSM)
+}
+```
+
+## Stage 7: Apply FSM Processing (Region A)
+**Thread**: Apply FSM Poller Thread
+**Time**: T6
+
+```rust
+// Apply FSM receives committed entry
+ApplyTask::CommittedEntries {
+    region_id: 1,
+    entries: vec![Entry {
+        index: 1001,
+        term: 5,
+        data: "user:123=John Doe"
+    }]
+}
+
+// Process the committed entry
+fn process_raft_cmd(&mut self, index: 1001, term: 5, req: RaftCmdRequest) {
+    // Deserialize the request
+    let put_req = req.get_requests()[0].get_put();
+    let key = put_req.get_key(); // "user:123"
+    let value = put_req.get_value(); // "John Doe"
+    
+    // Execute the actual write operation
+    let (mut cmd, exec_result, should_write) = self.apply_raft_cmd(apply_ctx, 1001, 5, req);
+    
+    if should_write {
+        // Add to write batch
+        self.kv_wb.put(key, value)?;
+        // kv_wb now contains: "user:123" -> "John Doe"
+        
+        // Update apply state
+        self.write_apply_state(apply_ctx.kv_wb_mut());
+        apply_ctx.commit(self);
+    }
+}
+```
+
+## Stage 8: Final RocksDB Persistence (Region A)
+**Thread**: Apply FSM Poller Thread
+**Time**: T7
+
+```rust
+// Write to RocksDB
+fn write_to_db(&mut self) -> (bool, Option<SequenceNumber>) {
+    if !self.kv_wb_mut().is_empty() {
+        let mut write_opts = WriteOptions::new();
+        write_opts.set_sync(true);
+        
+        // Write to RocksDB
+        let seq = self.kv_wb_mut().write_opt(&write_opts)?;
+        
+        // Persisted to disk:
+        // RocksDB: "user:123" -> "John Doe" (sequence number: 12345)
+    }
+    
+    // Invoke callback to notify client
+    if let Some(cmd_cb) = self.find_pending(1001, 5, false) {
+        cmd_cb.invoke_with_response(RaftCmdResponse {
+            header: ResponseHeader { /* ... */ },
+            responses: vec![Response {
+                cmd_type: CmdType::Put,
+                put: PutResponse { /* success */ }
+            }]
+        });
+    }
+}
+```
+
+## Parallel Processing Example
+
+Now let's see how Region B processes its write in parallel:
+
+### Region B Processing (Parallel to Region A)
+**Thread**: Peer FSM Poller Thread (same thread, different batch)
+**Time**: T2-T7 (overlapping with Region A)
+
+```rust
+// Region B receives its write request
+PeerMsg::RaftCommand(RaftCommand {
+    request: RaftCmdRequest {
+        header: RequestHeader { region_id: 2, /* ... */ },
+        requests: vec![Request {
+            cmd_type: CmdType::Put,
+            put: PutRequest {
+                key: b"user:456",
+                value: b"Jane Smith",
+                cf: "default"
+            }
+        }]
+    },
+    callback: Callback { /* ... */ }
+})
+
+// Similar flow as Region A:
+// 1. Propose to Raft (index: 1002)
+// 2. Raft consensus
+// 3. Raft ready processing
+// 4. Async write worker
+// 5. Apply FSM processing
+// 6. Final RocksDB persistence
+```
+
+## Batch System Polling Example
+
+```rust
+// Batch system poller processes multiple regions
+fn poll(&mut self) {
+    // Round 1: Process regions A and B
+    let mut batch = Batch::with_capacity(8); // max_batch_size = 8
+    
+    // Fetch FSMs for regions A and B
+    batch.normals = vec![
+        Some(PeerFsm { region_id: 1, /* ... */ }), // Region A
+        Some(PeerFsm { region_id: 2, /* ... */ }), // Region B
+    ];
+    
+    // Process each region sequentially within the batch
+    for (i, peer_fsm) in batch.normals.iter_mut().enumerate() {
+        let peer_fsm = peer_fsm.as_mut().unwrap();
+        
+        // Region A processing
+        if peer_fsm.region_id() == 1 {
+            // Process messages for Region A sequentially
+            while peer_fsm.receiver.len() > 0 {
+                let msg = peer_fsm.receiver.try_recv().unwrap();
+                // Process: RaftCommand for "user:123"
+            }
+        }
+        
+        // Region B processing  
+        if peer_fsm.region_id() == 2 {
+            // Process messages for Region B sequentially
+            while peer_fsm.receiver.len() > 0 {
+                let msg = peer_fsm.receiver.try_recv().unwrap();
+                // Process: RaftCommand for "user:456"
+            }
+        }
+    }
+}
+```
+
+## Timeline Summary
+
+```
+T0: Client sends write requests
+    ├── Request 1: "user:123" -> Region A
+    └── Request 2: "user:456" -> Region B
+
+T1: Store FSM routes messages
+    ├── Routes to Region A
+    └── Routes to Region B
+
+T2: Peer FSM processes (parallel)
+    ├── Region A: Propose "user:123" (index: 1001)
+    └── Region B: Propose "user:456" (index: 1002)
+
+T3: Raft consensus (parallel)
+    ├── Region A: Entry 1001 committed
+    └── Region B: Entry 1002 committed
+
+T4: Raft ready processing (parallel)
+    ├── Region A: Create write task for entry 1001
+    └── Region B: Create write task for entry 1002
+
+T5: Async write workers (parallel)
+    ├── Write Region A's raft log to RaftDB
+    └── Write Region B's raft log to RaftDB
+
+T6: Apply FSM processing (parallel)
+    ├── Region A: Apply entry 1001, add to KV write batch
+    └── Region B: Apply entry 1002, add to KV write batch
+
+T7: Final RocksDB persistence (parallel)
+    ├── Region A: Write "user:123" -> "John Doe" to RocksDB
+    └── Region B: Write "user:456" -> "Jane Smith" to RocksDB
+
+T8: Client callbacks invoked
+    ├── Notify client 1: Write successful
+    └── Notify client 2: Write successful
+```
+
+## Key Insights from This Example
+
+1. **Sequential per Region**: Within Region A, the "user:123" write is processed sequentially
+2. **Parallel across Regions**: Region A and Region B are processed in parallel
+3. **Batching**: Multiple messages per region are collected and processed together
+4. **Two-Phase Write**: Raft log first (T5), then state machine application (T6-T7)
+5. **Thread Coordination**: Different thread pools handle different stages
+6. **Consistency**: Raft ensures both regions maintain consistency within themselves
+
+This example shows how TiKV achieves both high performance (parallel processing) and strong consistency (sequential processing within regions) through its sophisticated thread scheduling and FSM architecture!
+
 ---
 
 *This document was generated by analyzing the TiKV codebase, specifically focusing on the write request flow through RaftStore thread pools and FSMs. For the most up-to-date information, please refer to the official TiKV documentation and source code.*
