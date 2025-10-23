@@ -1382,8 +1382,10 @@ while self.peer_msg_buf.len() < self.messages_per_tick {
 │  ├── Region 2: ApplyMsg Queue                             │
 │  └── Region N: ApplyMsg Queue                             │
 ├─────────────────────────────────────────────────────────────┤
-│  Async Write Worker Queues                                 │
-│  ├── WriteMsg Queue (batched writes)                      │
+│  Async Write Worker Queues (SHARED)                        │
+│  ├── WriteMsg Queue 1 (shared by all regions)             │
+│  ├── WriteMsg Queue 2 (shared by all regions)             │
+│  ├── WriteMsg Queue N (shared by all regions)             │
 │  └── WriteTask Queue (individual tasks)                   │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -1655,6 +1657,308 @@ This design ensures:
 - **Fault tolerance** through independent region processing
 
 The multiple queue architecture is a key reason why TiKV can handle thousands of regions efficiently while maintaining strong consistency guarantees!
+
+## WriteMsg Queue Architecture: Shared, Not Per-Region
+
+### WriteMsg Queue Structure
+
+**Important Correction: WriteMsg queues are SHARED across all regions, not per-region.**
+
+```rust
+// From components/raftstore/src/store/async_io/write_router.rs:271
+pub struct SharedSenders<EK: KvEngine, ER: RaftEngine>(Vec<Sender<WriteMsg<EK, ER>>>);
+
+// From components/raftstore/src/store/async_io/write_router.rs:309-313
+pub struct WriteSenders<EK: KvEngine, ER: RaftEngine> {
+    senders: Tracker<SharedSenders<EK, ER>>,
+    cached_senders: Vec<Sender<WriteMsg<EK, ER>>>,  // Multiple shared queues
+    io_reschedule_concurrent_count: Arc<AtomicUsize>,
+}
+```
+
+### WriteMsg Queue Details
+
+#### 1. **Shared Write Workers**
+```rust
+// From components/raftstore/src/store/async_io/write.rs:1096-1098
+pub fn senders(&self) -> WriteSenders<EK, ER> {
+    WriteSenders::new(self.writers.clone())
+}
+
+// From components/raftstore/src/store/async_io/write.rs:1109-1122
+let pool_size = cfg.value().store_io_pool_size;
+if pool_size > 0 {
+    self.increase_to(
+        pool_size,  // Multiple write workers share the load
+        StoreWritersContext { /* ... */ },
+    )?;
+}
+```
+
+#### 2. **Per-Peer WriteRouter**
+```rust
+// From components/raftstore/src/store/async_io/write_router.rs:61-79
+pub struct WriteRouter<EK, ER> {
+    tag: String,
+    writer_id: usize,  // Which shared queue to use
+    next_retry_time: Instant,
+    next_writer_id: Option<usize>,
+    last_unpersisted: Option<u64>,
+    pending_write_msgs: Vec<WriteMsg<EK, ER>>,  // Local buffering
+    last_msg_priority: Option<u64>,
+}
+```
+
+#### 3. **Message Routing to Shared Queues**
+```rust
+// From components/raftstore/src/store/async_io/write_router.rs:239-262
+fn send<C: WriteRouterContext<EK, ER>>(&mut self, ctx: &mut C, msg: WriteMsg<EK, ER>) {
+    let sender = &ctx.write_senders()[self.writer_id];  // Select shared queue
+    sender.consume_msg_resource(&msg);
+    match sender.try_send(msg, self.last_msg_priority) {
+        Ok(priority) => self.last_msg_priority = priority,
+        Err(TrySendError::Full(msg)) => {
+            // Blocking send to shared queue
+            sender.send(msg, self.last_msg_priority).unwrap();
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            safe_panic!("failed to send write msg, err: disconnected");
+        }
+    }
+}
+```
+
+### WriteMsg Queue Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                WriteMsg Queue Architecture                   │
+├─────────────────────────────────────────────────────────────┤
+│  Per-Region WriteRouter (Load Balancing)                    │
+│  ├── Region 1: WriteRouter -> Queue 0                      │
+│  ├── Region 2: WriteRouter -> Queue 1                      │
+│  ├── Region 3: WriteRouter -> Queue 0                      │
+│  ├── Region 4: WriteRouter -> Queue 2                      │
+│  └── Region N: WriteRouter -> Queue (N % pool_size)        │
+├─────────────────────────────────────────────────────────────┤
+│  Shared WriteMsg Queues (All Regions)                       │
+│  ├── WriteMsg Queue 0: [Region1, Region3, Region5, ...]   │
+│  ├── WriteMsg Queue 1: [Region2, Region6, Region7, ...]   │
+│  ├── WriteMsg Queue 2: [Region4, Region8, Region9, ...]   │
+│  └── WriteMsg Queue N: [RegionX, RegionY, RegionZ, ...]   │
+├─────────────────────────────────────────────────────────────┤
+│  Write Workers (Per Queue)                                  │
+│  ├── Write Worker 0: Processes Queue 0                     │
+│  ├── Write Worker 1: Processes Queue 1                     │
+│  ├── Write Worker 2: Processes Queue 2                     │
+│  └── Write Worker N: Processes Queue N                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Benefits of Shared WriteMsg Queues
+
+#### 1. **Load Balancing**
+- Multiple regions share the same write workers
+- Better resource utilization
+- Reduced thread overhead
+
+#### 2. **Batching Efficiency**
+- Multiple regions' writes can be batched together
+- Better RocksDB write performance
+- Reduced I/O overhead
+
+#### 3. **Resource Management**
+- Configurable pool size (`store_io_pool_size`)
+- Better control over write concurrency
+- Prevents write worker explosion
+
+## RocksDB Storage Architecture: Shared Engine, Key-Based Separation
+
+### Storage Engine Structure
+
+**All regions share the same RocksDB instance, but data is separated by key encoding and column families.**
+
+### Key Encoding Strategy
+
+#### 1. **Data Key Encoding**
+```rust
+// From components/keys/src/lib.rs:28-31
+pub const DATA_PREFIX: u8 = b'z';
+pub const DATA_PREFIX_KEY: &[u8] = &[DATA_PREFIX];
+pub const DATA_MIN_KEY: &[u8] = &[DATA_PREFIX];
+pub const DATA_MAX_KEY: &[u8] = &[DATA_PREFIX + 1];
+
+// From components/keys/src/lib.rs:101-108
+pub fn data_key(key: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(key.len() + 1);
+    encoded.push(DATA_PREFIX);
+    encoded.extend_from_slice(key);
+    encoded
+}
+```
+
+#### 2. **Region Boundary Encoding**
+```rust
+// From components/keys/src/lib.rs:109-116
+pub fn enc_start_key(region: &Region) -> Vec<u8> {
+    if region.get_start_key().is_empty() {
+        DATA_MIN_KEY.to_vec()
+    } else {
+        data_key(region.get_start_key())
+    }
+}
+
+pub fn enc_end_key(region: &Region) -> Vec<u8> {
+    if region.get_end_key().is_empty() {
+        DATA_MAX_KEY.to_vec()
+    } else {
+        data_key(region.get_end_key())
+    }
+}
+```
+
+### Column Family Organization
+
+#### 1. **Three Main Column Families**
+```rust
+// From components/raftstore/src/store/snap.rs:56
+pub const SNAPSHOT_CFS: &[CfName] = &[CF_DEFAULT, CF_LOCK, CF_WRITE];
+
+// From engine_traits/src/lib.rs
+pub const CF_DEFAULT: &str = "default";
+pub const CF_LOCK: &str = "lock";
+pub const CF_WRITE: &str = "write";
+```
+
+#### 2. **Column Family Usage**
+```rust
+// From components/raftstore/src/store/fsm/apply.rs:1879-1907
+if !req.get_put().get_cf().is_empty() {
+    let cf = req.get_put().get_cf();
+    if cf == CF_LOCK {
+        self.metrics.lock_cf_written_bytes += key.len() as u64;
+        self.metrics.lock_cf_written_bytes += value.len() as u64;
+    }
+    ctx.kv_wb.put_cf(cf, key, value).unwrap();
+} else {
+    ctx.kv_wb.put(key, value).unwrap();  // Default CF
+}
+```
+
+### RocksDB Storage Layout
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Single RocksDB Instance                  │
+├─────────────────────────────────────────────────────────────┤
+│  Column Family: CF_DEFAULT                                  │
+│  ├── z|user:123|... -> "John Doe"                          │
+│  ├── z|user:456|... -> "Jane Smith"                        │
+│  ├── z|order:789|... -> "Order Data"                       │
+│  └── z|product:abc|... -> "Product Info"                   │
+├─────────────────────────────────────────────────────────────┤
+│  Column Family: CF_WRITE                                    │
+│  ├── z|user:123|... -> Write Record                        │
+│  ├── z|user:456|... -> Write Record                        │
+│  ├── z|order:789|... -> Write Record                       │
+│  └── z|product:abc|... -> Write Record                     │
+├─────────────────────────────────────────────────────────────┤
+│  Column Family: CF_LOCK                                     │
+│  ├── z|user:123|... -> Lock Info                           │
+│  ├── z|user:456|... -> Lock Info                           │
+│  ├── z|order:789|... -> Lock Info                          │
+│  └── z|product:abc|... -> Lock Info                        │
+├─────────────────────────────────────────────────────────────┤
+│  Column Family: CF_RAFT (Raft Metadata)                    │
+│  ├── 0x01|0x02|region_id|0x01|log_index -> Raft Log       │
+│  ├── 0x01|0x02|region_id|0x02 -> Raft State               │
+│  ├── 0x01|0x02|region_id|0x03 -> Apply State              │
+│  └── 0x01|0x03|region_id|0x01 -> Region State            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Region Data Separation
+
+#### 1. **Key Range Separation**
+```rust
+// From components/raftstore/src/store/region_snapshot.rs:340-350
+fn update_lower_bound(iter_opt: &mut IterOptions, region: &Region) {
+    let region_start_key = keys::enc_start_key(region);
+    if iter_opt.lower_bound().is_some() {
+        iter_opt.set_lower_bound_prefix(keys::DATA_PREFIX_KEY);
+        if region_start_key.as_slice() > *iter_opt.lower_bound().as_ref().unwrap() {
+            iter_opt.set_vec_lower_bound(region_start_key);
+        }
+    } else {
+        iter_opt.set_vec_lower_bound(region_start_key);
+    }
+}
+```
+
+#### 2. **Region Iterator**
+```rust
+// From components/raftstore/src/store/region_snapshot.rs:325-331
+pub struct RegionIterator<S: Snapshot> {
+    iter: <S as Iterable>::Iterator,
+    region: Arc<Region>,  // Enforces region boundaries
+}
+
+// From components/raftstore/src/store/region_snapshot.rs:369-381
+pub fn new(
+    snap: &S,
+    region: Arc<Region>,
+    mut iter_opt: IterOptions,
+    cf: &str,
+) -> RegionIterator<S> {
+    update_lower_bound(&mut iter_opt, &region);
+    update_upper_bound(&mut iter_opt, &region);
+    let iter = snap.iterator_opt(cf, iter_opt).expect("creating snapshot iterator");
+    RegionIterator { iter, region }
+}
+```
+
+### Storage Benefits
+
+#### 1. **Single Engine Efficiency**
+- One RocksDB instance handles all regions
+- Shared memory and cache
+- Unified compaction and maintenance
+
+#### 2. **Key-Based Isolation**
+- Region boundaries enforced by key encoding
+- No cross-region data contamination
+- Efficient range queries per region
+
+#### 3. **Column Family Separation**
+- Different data types in separate CFs
+- Independent tuning per CF
+- Better compression and caching
+
+#### 4. **Raft Metadata Separation**
+- Raft logs stored separately from user data
+- Different access patterns optimized
+- Easier backup and recovery
+
+### Multi-Tablet Architecture (Optional)
+
+```rust
+// From components/raftstore/src/store/worker/split_check.rs:612-624
+let tablet = match &self.engine {
+    Either::Left(e) => e,  // Single RocksDB
+    Either::Right(r) => match r.get(region.get_id()) {  // Multi-tablet
+        Some(c) => {
+            cached = Some(c);
+            match cached.as_mut().unwrap().latest() {
+                Some(t) => t,
+                None => return,
+            }
+        }
+        None => return,
+    },
+};
+```
+
+**Note**: TiKV supports both single-RocksDB and multi-tablet architectures, but the default is single-RocksDB with key-based separation.
 
 ---
 
