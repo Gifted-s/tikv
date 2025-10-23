@@ -1960,6 +1960,274 @@ let tablet = match &self.engine {
 
 **Note**: TiKV supports both single-RocksDB and multi-tablet architectures, but the default is single-RocksDB with key-based separation.
 
+## Apply FSM Queue: The State Machine Application Layer
+
+### Role of Apply FSM Queue
+
+The **Apply FSM queue** is responsible for **applying committed Raft entries to the state machine** and **executing the actual KV operations**. It serves as the bridge between Raft consensus (log replication) and the actual data persistence.
+
+### Apply FSM Queue Architecture
+
+#### 1. **Per-Region Apply FSM Queues**
+```rust
+// From components/raftstore/src/store/fsm/apply.rs:3999-4006
+pub struct ApplyFsm<EK: KvEngine> {
+    delegate: ApplyDelegate<EK>,
+    receiver: Receiver<Box<Msg<EK>>>,  // Per-region message queue
+    mailbox: Option<BasicMailbox<ApplyFsm<EK>>>,
+}
+```
+
+#### 2. **Apply Message Types**
+```rust
+// From components/raftstore/src/store/fsm/apply.rs:3812-3849
+pub enum Msg<EK: KvEngine> {
+    Apply {
+        start: Instant,
+        apply: Apply<Callback<EK::Snapshot>>,  // Committed entries to apply
+    },
+    Registration(Registration),                // FSM registration
+    LogsUpToDate(CatchUpLogs),                // Merge operation
+    Noop,                                     // No operation
+    Destroy(Destroy),                         // Region destruction
+    Snapshot(GenSnapTask),                    // Snapshot generation
+    Change {                                  // Observer changes
+        cmd: ChangeObserver,
+        region_epoch: RegionEpoch,
+        cb: Callback<EK::Snapshot>,
+    },
+    Recover(u64),                             // Recovery operations
+    CheckCompact {                            // Compaction checks
+        region_id: u64,
+        voter_replicated_index: u64,
+        voter_replicated_term: u64,
+    },
+    UnsafeForceCompact {                      // Force compaction
+        region_id: u64,
+        term: u64,
+        compact_index: u64,
+    },
+    InMemoryEngineLoadRegion {                // In-memory engine loading
+        region_id: u64,
+        trigger_load_cb: Box<dyn FnOnce(&Region) + Send + 'static>,
+    },
+}
+```
+
+### Apply FSM Processing Flow
+
+#### 1. **Message Collection and Processing**
+```rust
+// From components/raftstore/src/store/fsm/apply.rs:4769-4784
+while self.msg_buf.len() < self.messages_per_tick {
+    match normal.receiver.try_recv() {
+        Ok(msg) => self.msg_buf.push(msg),
+        Err(TryRecvError::Empty) => {
+            handle_result = HandleResult::stop_at(0, false);
+            break;
+        }
+        Err(TryRecvError::Disconnected) => {
+            normal.delegate.stopped = true;
+            handle_result = HandleResult::stop_at(0, false);
+            break;
+        }
+    }
+}
+
+normal.handle_tasks(&mut self.apply_ctx, &mut self.msg_buf);
+```
+
+#### 2. **Apply Task Processing**
+```rust
+// From components/raftstore/src/store/fsm/apply.rs:4501-4533
+match *msg {
+    Msg::Apply { start, mut apply } => {
+        let apply_wait = start.saturating_elapsed();
+        apply_ctx.apply_wait.observe(apply_wait.as_secs_f64());
+        
+        if let Some(batch) = batch_apply.as_mut() {
+            if batch.try_batch(&mut apply) {
+                continue;  // Batch with previous apply
+            } else {
+                self.handle_apply(apply_ctx, batch_apply.take().unwrap());
+            }
+        }
+        if !self.delegate.wait_data {
+            batch_apply = Some(apply);
+        }
+    }
+    // Handle other message types...
+}
+```
+
+#### 3. **Committed Entries Processing**
+```rust
+// From components/raftstore/src/store/fsm/apply.rs:1141-1218
+fn handle_raft_committed_entries(
+    &mut self,
+    apply_ctx: &mut ApplyContext<EK>,
+    mut committed_entries_drainer: Drain<'_, Entry>,
+) {
+    if committed_entries_drainer.len() == 0 {
+        return;
+    }
+    apply_ctx.prepare_for(self);
+    apply_ctx.committed_count += committed_entries_drainer.len();
+    
+    while let Some(entry) = committed_entries_drainer.next() {
+        let expect_index = self.apply_state.get_applied_index() + 1;
+        if expect_index != entry.get_index() {
+            panic!("expect index {}, but got {}", expect_index, entry.get_index());
+        }
+        
+        let res = match entry.get_entry_type() {
+            EntryType::EntryNormal => self.handle_raft_entry_normal(apply_ctx, &entry),
+            EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
+                self.handle_raft_entry_conf_change(apply_ctx, &entry)
+            }
+        };
+        
+        match res {
+            ApplyResult::None => {}
+            ApplyResult::Res(res) => {
+                results.push_back(res);
+                if self.wait_data {
+                    break;
+                }
+            }
+            ApplyResult::Yield | ApplyResult::WaitMergeSource(_) => {
+                // Yield processing for high-latency operations
+                return;
+            }
+        }
+    }
+    apply_ctx.finish_for(self, results);
+}
+```
+
+### Apply FSM Queue Processing Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                Apply FSM Queue Processing                    │
+├─────────────────────────────────────────────────────────────┤
+│  1. Message Collection                                       │
+│     ├── ApplyMsg::Apply (committed entries)                 │
+│     ├── ApplyMsg::Registration (FSM registration)           │
+│     ├── ApplyMsg::Destroy (region destruction)              │
+│     ├── ApplyMsg::Snapshot (snapshot generation)            │
+│     └── ApplyMsg::Change (observer changes)                 │
+├─────────────────────────────────────────────────────────────┤
+│  2. Message Batching                                        │
+│     ├── Batch multiple Apply messages                       │
+│     ├── Yield for high-latency operations                  │
+│     └── Resume pending messages                             │
+├─────────────────────────────────────────────────────────────┤
+│  3. Committed Entries Processing                            │
+│     ├── Validate entry sequence                            │
+│     ├── Process normal entries (KV operations)             │
+│     ├── Process conf change entries                        │
+│     └── Update apply state                                 │
+├─────────────────────────────────────────────────────────────┤
+│  4. KV Operations Execution                                 │
+│     ├── PUT operations (data writes)                       │
+│     ├── DELETE operations (data deletions)                 │
+│     ├── DELETE_RANGE operations (range deletions)          │
+│     └── INGEST_SST operations (SST ingestion)              │
+├─────────────────────────────────────────────────────────────┤
+│  5. WriteBatch Preparation                                 │
+│     ├── Add operations to WriteBatch                       │
+│     ├── Update apply state                                 │
+│     ├── Prepare for persistence                            │
+│     └── Commit to RocksDB                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Functions of Apply FSM Queue
+
+#### 1. **State Machine Application**
+- **Applies committed Raft entries** to the actual state machine
+- **Executes KV operations** (PUT, DELETE, DELETE_RANGE, INGEST_SST)
+- **Maintains apply state** (applied_index, commit_index, commit_term)
+
+#### 2. **WriteBatch Management**
+```rust
+// From components/raftstore/src/store/fsm/apply.rs:542-572
+pub fn prepare_for(&mut self, delegate: &mut ApplyDelegate<EK>) {
+    self.applied_batch.push_batch(&delegate.observe_info, delegate.region.get_id());
+    self.kv_wb.prepare_for_region(&delegate.region);
+}
+
+pub fn commit(&mut self, delegate: &mut ApplyDelegate<EK>) {
+    if delegate.last_flush_applied_index < delegate.apply_state.get_applied_index() {
+        delegate.maybe_write_apply_state(self);
+    }
+    self.commit_opt(delegate, true);
+}
+
+pub fn write_to_db(&mut self) -> (bool, Option<SequenceNumber>) {
+    let need_sync = self.sync_log_hint && !self.disable_wal;
+    // Write to RocksDB with proper sync options
+}
+```
+
+#### 3. **Callback Management**
+```rust
+// From components/raftstore/src/store/fsm/apply.rs:1441-1452
+let cmd_cb = self.find_pending(index, term, is_conf_change_cmd(&cmd.request));
+apply_ctx
+    .applied_batch
+    .push(cmd_cb, cmd, &self.observe_info, self.region_id());
+if should_write {
+    self.write_apply_state(apply_ctx.kv_wb_mut());
+    apply_ctx.commit(self);
+}
+```
+
+#### 4. **Performance Optimization**
+- **Batching**: Multiple apply messages can be batched together
+- **Yielding**: High-latency operations yield to prevent blocking
+- **Priority handling**: Different priority levels for different operations
+
+### Apply FSM Queue Benefits
+
+#### 1. **Asynchronous Processing**
+- **Decouples Raft consensus** from state machine application
+- **Allows parallel processing** of different regions
+- **Prevents blocking** on slow I/O operations
+
+#### 2. **Consistency Guarantees**
+- **Sequential processing** within each region
+- **Proper error handling** and recovery
+- **State machine consistency** maintenance
+
+#### 3. **Performance Optimization**
+- **Batching** reduces I/O overhead
+- **Yielding** prevents head-of-line blocking
+- **Priority scheduling** for different operation types
+
+#### 4. **Resource Management**
+- **Memory management** for large operations
+- **SST file handling** for snapshots and ingestion
+- **Callback management** for client responses
+
+### Apply FSM Queue in Write Flow
+
+```
+Write Request → Peer FSM → Raft Consensus → Apply FSM Queue → RocksDB
+     ↓              ↓            ↓              ↓              ↓
+  RaftCommand → Propose → Committed → Apply → Persist
+     ↓              ↓            ↓              ↓              ↓
+  Callback ← Response ← ApplyRes ← Execute ← WriteBatch
+```
+
+The Apply FSM queue is the **critical component** that ensures:
+1. **Committed Raft entries are applied** to the state machine
+2. **KV operations are executed** in the correct order
+3. **Data is persisted** to RocksDB
+4. **Client callbacks are invoked** with results
+5. **Consistency is maintained** across all operations
+
 ---
 
 *This document was generated by analyzing the TiKV codebase, specifically focusing on the write request flow through RaftStore thread pools and FSMs. For the most up-to-date information, please refer to the official TiKV documentation and source code.*
